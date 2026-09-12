@@ -1,0 +1,101 @@
+pipeline {
+    agent any
+
+    tools {
+        dockerTool 'docker'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        AWS_ACCOUNT_ID = '191014622554'
+        AWS_REGION     = 'ap-south-1'
+        ECR_REPO       = 'three-tier-backend'
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        APP_DIR        = 'Application-Code/backend'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/ChaitanyaDaterao/End-to-End-Kubernetes-Three-Tier-DevSecOps-MERN-Stack-Project.git'
+            }
+        }
+
+        stage('Extract App Code') {
+            steps {
+                sh 'unzip -o Application-Code.zip'
+            }
+        }
+
+        stage('Code Quality Analysis') {
+            steps {
+                dir("${APP_DIR}") {
+                    withSonarQubeEnv('sonar-server') {
+                        sh """
+                            ${SCANNER_HOME}/bin/sonar-scanner \
+                            -Dsonar.projectKey=three-tier-backend \
+                            -Dsonar.projectName=three-tier-backend \
+                            -Dsonar.sources=.
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Dependency Check') {
+            steps {
+                dir("${APP_DIR}") {
+                    withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+                        dependencyCheck additionalArguments: "--scan . --format XML --disableYarnAudit --disableNodeAudit --nvdApiKey ${NVD_API_KEY}", odcInstallation: 'DC'
+                    }
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+
+        stage('File Scan (Trivy)') {
+            steps {
+                dir("${APP_DIR}") {
+                    sh 'trivy fs . --severity HIGH,CRITICAL --exit-code 0 --format table -o trivy-fs-report.txt'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir("${APP_DIR}") {
+                    sh "docker build -t ${ECR_REPO}:${BUILD_NUMBER} ."
+                }
+            }
+        }
+
+        stage('ECR Image Scan (Trivy)') {
+            steps {
+                sh "trivy image ${ECR_REPO}:${BUILD_NUMBER} --severity HIGH,CRITICAL --exit-code 0 --format table -o trivy-image-report.txt"
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        docker tag ${ECR_REPO}:${BUILD_NUMBER} ${ECR_REGISTRY}/${ECR_REPO}:${BUILD_NUMBER}
+                        docker push ${ECR_REGISTRY}/${ECR_REPO}:${BUILD_NUMBER}
+                    """
+                }
+            }
+        }
+
+        // "Updating Deployment File" stage will be added once the
+        // Kubernetes-Manifests GitOps repo exists (upcoming ArgoCD step).
+
+    }
+
+    post {
+        always {
+            echo "Pipeline finished. Build #${BUILD_NUMBER} for ${ECR_REPO}"
+        }
+    }
+}
